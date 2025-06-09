@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-Bambu Lab Personal Print Logger with Connection Testing
-Automatically logs print data to Excel with proper connection validation.
+Bambu Lab Local Print Logger with API Integration
+Automatically logs print data to Excel using local REST API calls.
+LAN-only version for direct printer communication.
 """
 
 import json
 import time
 import sys
 import argparse
-import socket
+import requests
 import threading
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List
-import paho.mqtt.client as mqtt
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 import pandas as pd
 import os
-from pathlib import Path
+import urllib3
+
+# Disable SSL warnings for local printer connections
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 @dataclass
@@ -34,139 +37,225 @@ class PrintLog:
     nozzle_temp: float = 0.0
 
 
-class BambuPrintLogger:
-    def __init__(self, bambu_ip: str, bambu_id: str, excel_file: str = "print_log.xlsx"):
+class BambuLocalAPILogger:
+    """Bambu Lab printer logger using local REST API"""
+    
+    def __init__(self, bambu_ip: str, access_code: str, excel_file: str = "print_log.xlsx"):
         self.bambu_ip = bambu_ip
-        self.bambu_id = bambu_id
+        self.access_code = access_code
         self.excel_file = excel_file
-        self.mqtt_client = mqtt.Client()
         
-        # Connection status tracking
-        self.connection_confirmed = False
-        self.data_received = False
-        self.connection_timeout = 30  # seconds
+        # API configuration
+        self.base_url = f"http://{bambu_ip}"  # Try HTTP first
+        self.https_base_url = f"https://{bambu_ip}"  # Fallback to HTTPS
+        self.use_https = False
+        
+        # Session for connection reuse
+        self.session = requests.Session()
+        self.session.verify = False  # For local HTTPS connections
         
         # Current print tracking
         self.print_start_time: Optional[datetime] = None
-        self.print_start_gcode_time: int = 0
         self.current_gcode_file: str = ""
         self.is_printing = False
-        self.last_mc_percent = 0
+        self.last_progress = 0
+        self.print_start_gcode_time: int = 0
         
         # Print data collection
         self.bed_temp = 0.0
         self.nozzle_temp = 0.0
         self.current_filament_type = ""
-        self.filament_used = 0.0
         
-        # Message counter for confirmation
+        # Polling control
+        self.polling = False
+        self.poll_interval = 3  # seconds
         self.message_count = 0
-        
-        # MQTT setup
-        self.mqtt_client.on_connect = self.on_connect
-        self.mqtt_client.on_message = self.on_message
-        self.mqtt_client.on_disconnect = self.on_disconnect
         
         # Initialize Excel file
         self.init_excel_file()
 
-    def test_network_connectivity(self) -> bool:
-        """Test basic network connectivity to the printer IP"""
-        print(f"🔍 Testing network connectivity to {self.bambu_ip}...")
+    def test_connection(self) -> bool:
+        """Test connection to local printer API"""
+        print(f"🔍 Testing connection to {self.bambu_ip}...")
         
-        # Test if host is reachable on common ports
-        ports_to_test = [1883, 80, 443]  # MQTT, HTTP, HTTPS
+        # Test both HTTP and HTTPS
+        for use_https in [False, True]:
+            base_url = self.https_base_url if use_https else self.base_url
+            protocol = "HTTPS" if use_https else "HTTP"
+            
+            print(f"🔗 Trying {protocol} connection...")
+            
+            # Common API endpoints to try
+            endpoints = [
+                "/v1/status",
+                "/api/v1/status", 
+                "/api/status",
+                "/status"
+            ]
+            
+            for endpoint in endpoints:
+                try:
+                    url = f"{base_url}{endpoint}"
+                    headers = self.get_headers()
+                    
+                    response = self.session.get(url, headers=headers, timeout=5)
+                    
+                    if response.status_code == 200:
+                        print(f"✅ {protocol} connection successful on {endpoint}")
+                        self.base_url = base_url
+                        self.use_https = use_https
+                        
+                        # Verify we can get printer data
+                        data = response.json()
+                        if self.validate_printer_data(data):
+                            print(f"📊 Printer data accessible")
+                            return True
+                        else:
+                            print(f"⚠️  Connected but printer data format unexpected")
+                            
+                    elif response.status_code == 401:
+                        print(f"❌ Authentication failed on {endpoint} - check access code")
+                        
+                    elif response.status_code == 404:
+                        continue  # Try next endpoint
+                        
+                except requests.exceptions.ConnectionError:
+                    continue  # Try next endpoint or protocol
+                except requests.exceptions.Timeout:
+                    continue
+                except Exception as e:
+                    continue
         
-        for port in ports_to_test:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                result = sock.connect_ex((self.bambu_ip, port))
-                sock.close()
-                
-                if result == 0:
-                    print(f"✅ Network connectivity OK - Port {port} is open")
-                    return True
-            except Exception as e:
-                continue
-        
-        print(f"❌ Network connectivity FAILED - No open ports found")
-        print(f"   Make sure {self.bambu_ip} is the correct IP address")
-        print(f"   Check if printer is powered on and connected to network")
+        print(f"❌ Could not establish connection to {self.bambu_ip}")
+        print(f"   Possible issues:")
+        print(f"   - Printer is not powered on")
+        print(f"   - Wrong IP address")
+        print(f"   - Wrong access code")
+        print(f"   - Printer doesn't support API access")
         return False
 
-    def test_mqtt_connection(self) -> bool:
-        """Test MQTT connection and wait for data"""
-        print(f"🔗 Testing MQTT connection to {self.bambu_ip}:1883...")
-        
-        connection_event = threading.Event()
-        data_event = threading.Event()
-        
-        def on_connect_test(client, userdata, flags, rc):
-            if rc == 0:
-                print(f"✅ MQTT connection successful")
-                topic = f"device/{self.bambu_id}/report"
-                client.subscribe(topic)
-                print(f"📡 Subscribed to topic: {topic}")
-                connection_event.set()
-            else:
-                print(f"❌ MQTT connection failed (code: {rc})")
-                connection_event.set()
-        
-        def on_message_test(client, userdata, msg):
-            try:
-                data = json.loads(msg.payload.decode())
-                if "print" in data:
-                    print(f"✅ Receiving printer data successfully!")
-                    print(f"📊 Sample data: Print stage, temperatures, progress, etc.")
-                    self.data_received = True
-                    data_event.set()
-            except:
-                pass
-        
-        # Set up test client
-        test_client = mqtt.Client()
-        test_client.on_connect = on_connect_test
-        test_client.on_message = on_message_test
-        
-        try:
-            test_client.connect(self.bambu_ip, 1883, 60)
-            test_client.loop_start()
-            
-            # Wait for connection
-            if not connection_event.wait(timeout=10):
-                print(f"❌ MQTT connection timeout")
-                test_client.loop_stop()
-                test_client.disconnect()
-                return False
-            
-            # Wait for data
-            print(f"⏳ Waiting for printer data (up to 15 seconds)...")
-            if data_event.wait(timeout=15):
-                print(f"🎉 Connection test PASSED - Ready to log prints!")
-                test_client.loop_stop()
-                test_client.disconnect()
-                return True
-            else:
-                print(f"⚠️  MQTT connected but no data received")
-                print(f"   This might be normal if printer is idle")
-                print(f"   The logger will still work when printing starts")
-                test_client.loop_stop()
-                test_client.disconnect()
-                return True  # Consider this OK
-                
-        except Exception as e:
-            print(f"❌ MQTT connection error: {e}")
-            return False
+    def validate_printer_data(self, data: Dict[str, Any]) -> bool:
+        """Validate that we received expected printer data"""
+        # Look for common printer data fields
+        expected_fields = ['print', 'status', 'state', 'progress', 'temperature']
+        return any(field in data for field in expected_fields)
 
-    def validate_printer_id(self) -> bool:
-        """Validate that the printer ID format looks correct"""
-        if len(self.bambu_id) < 10:
-            print(f"⚠️  Warning: Printer ID '{self.bambu_id}' seems short")
-            print(f"   Typical format: 00M00A261900054 (15 characters)")
-            response = input("Continue anyway? (y/N): ").lower()
-            return response == 'y'
-        return True
+    def get_headers(self) -> Dict[str, str]:
+        """Get headers for API requests"""
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'BambuLocalLogger/1.0'
+        }
+        
+        if self.access_code:
+            # Try different authentication methods
+            headers['Authorization'] = f'Bearer {self.access_code}'
+            headers['X-Access-Code'] = self.access_code
+        
+        return headers
+
+    def get_printer_status(self) -> Optional[Dict[str, Any]]:
+        """Get current printer status via local API"""
+        try:
+            # Try the working endpoint we found during connection test
+            endpoints = ["/v1/status", "/api/v1/status", "/api/status", "/status"]
+            
+            for endpoint in endpoints:
+                url = f"{self.base_url}{endpoint}"
+                headers = self.get_headers()
+                
+                response = self.session.get(url, headers=headers, timeout=3)
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 404:
+                    continue
+                else:
+                    # Log error but continue trying
+                    if self.message_count <= 3:
+                        print(f"⚠️  API returned HTTP {response.status_code} for {endpoint}")
+            
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            if self.message_count <= 3:
+                print(f"❌ API request error: {e}")
+            return None
+        except Exception as e:
+            if self.message_count <= 3:
+                print(f"❌ Unexpected error: {e}")
+            return None
+
+    def extract_print_data(self, status_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract print information from status data"""
+        if not status_data:
+            return {}
+        
+        # Handle different possible API response formats
+        print_data = status_data.get('print', status_data)
+        
+        # Extract basic print information
+        extracted = {
+            'progress': self.safe_get_numeric(print_data, ['mc_percent', 'progress', 'percent'], 0),
+            'state': self.safe_get_string(print_data, ['gcode_state', 'state', 'status'], ''),
+            'gcode_file': self.safe_get_string(print_data, ['gcode_file', 'filename', 'file'], ''),
+            'bed_temp': self.safe_get_numeric(print_data, ['bed_temper', 'bed_temp', 'bed_temperature'], 0.0),
+            'nozzle_temp': self.safe_get_numeric(print_data, ['nozzle_temper', 'nozzle_temp', 'nozzle_temperature'], 0.0),
+            'remaining_time': self.safe_get_numeric(print_data, ['mc_remaining_time', 'remaining_time', 'time_remaining'], 0),
+            'start_time': self.safe_get_numeric(print_data, ['gcode_start_time', 'start_time', 'print_start_time'], 0)
+        }
+        
+        # Extract filament information
+        ams_data = print_data.get('ams', {})
+        extracted['filament_type'] = self.extract_filament_info(ams_data, print_data)
+        
+        return extracted
+
+    def safe_get_numeric(self, data: Dict[str, Any], keys: list, default: float = 0.0) -> float:
+        """Safely get numeric value from data using multiple possible keys"""
+        for key in keys:
+            if key in data:
+                try:
+                    return float(data[key])
+                except (ValueError, TypeError):
+                    continue
+        return default
+
+    def safe_get_string(self, data: Dict[str, Any], keys: list, default: str = '') -> str:
+        """Safely get string value from data using multiple possible keys"""
+        for key in keys:
+            if key in data and data[key]:
+                return str(data[key])
+        return default
+
+    def extract_filament_info(self, ams_data: Dict[str, Any], print_data: Dict[str, Any]) -> str:
+        """Extract filament type from AMS data or print data"""
+        try:
+            # Try to get from direct filament field first
+            filament_direct = self.safe_get_string(print_data, ['filament_type', 'material', 'filament'], '')
+            if filament_direct:
+                return filament_direct
+            
+            # Try to extract from AMS data
+            if ams_data and "ams" in ams_data:
+                current_tray = ams_data.get("tray_now", "0")
+                
+                try:
+                    tray_num = int(current_tray)
+                    ams_index = tray_num // 4
+                    tray_index = tray_num % 4
+                except:
+                    return "Unknown"
+                
+                ams_list = ams_data.get("ams", [])
+                if ams_index < len(ams_list):
+                    trays = ams_list[ams_index].get("tray", [])
+                    if tray_index < len(trays):
+                        return trays[tray_index].get("tray_type", "Unknown")
+            
+            return "Unknown"
+        except Exception:
+            return "Unknown"
 
     def init_excel_file(self):
         """Initialize Excel file with headers if it doesn't exist"""
@@ -181,134 +270,28 @@ class BambuPrintLogger:
         else:
             print(f"✅ Using existing Excel file: {self.excel_file}")
 
-    def on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            print(f"🔗 Connected to MQTT broker")
-            topic = f"device/{self.bambu_id}/report"
-            client.subscribe(topic)
-            print(f"📡 Listening for printer data...")
-            self.connection_confirmed = True
-        else:
-            print(f"❌ MQTT connection failed (code: {rc})")
-
-    def on_disconnect(self, client, userdata, rc):
-        print(f"🔌 Disconnected from MQTT broker")
-        if rc != 0:
-            print(f"⚠️  Unexpected disconnection (code: {rc})")
-
-    def extract_filament_info(self, ams_data):
-        """Extract filament type from AMS data"""
-        try:
-            if not ams_data or "ams" not in ams_data:
-                return "Unknown"
-            
-            # Get current tray info
-            current_tray = ams_data.get("tray_now", "0")
-            
-            # Parse tray number (format might be like "6" meaning AMS 1, Tray 2)
-            try:
-                tray_num = int(current_tray)
-                ams_index = tray_num // 4  # Each AMS has 4 trays
-                tray_index = tray_num % 4
-            except:
-                return "Unknown"
-            
-            # Get filament type from the appropriate AMS and tray
-            ams_list = ams_data.get("ams", [])
-            if ams_index < len(ams_list):
-                trays = ams_list[ams_index].get("tray", [])
-                if tray_index < len(trays):
-                    return trays[tray_index].get("tray_type", "Unknown")
-            
-            return "Unknown"
-        except Exception as e:
-            return "Unknown"
-
-    def on_message(self, client, userdata, msg):
-        try:
-            # Parse JSON message
-            data = json.loads(msg.payload.decode())
-            print_data = data.get("print", {})
-            
-            # Increment message counter for debugging
-            self.message_count += 1
-            
-            # Show confirmation of data reception (only first few times)
-            if self.message_count <= 3:
-                print(f"📨 Message #{self.message_count}: Receiving data from printer")
-                if self.message_count == 3:
-                    print(f"✅ Data reception confirmed - switching to print monitoring mode")
-            
-            # Extract key fields
-            mc_percent = print_data.get("mc_percent", 0)
-            gcode_state = print_data.get("gcode_state", "")
-            gcode_file = print_data.get("gcode_file", "")
-            gcode_start_time = print_data.get("gcode_start_time", "0")
-            bed_temp = print_data.get("bed_temper", 0.0)
-            nozzle_temp = print_data.get("nozzle_temper", 0.0)
-            mc_remaining_time = print_data.get("mc_remaining_time", 0)
-            
-            # Extract AMS/filament info
-            ams_data = print_data.get("ams", {})
-            filament_type = self.extract_filament_info(ams_data)
-            
-            # Update current temperatures
-            self.bed_temp = bed_temp
-            self.nozzle_temp = nozzle_temp
-            
-            # Show current status (less frequent updates)
-            if self.message_count % 10 == 0:  # Every 10th message
-                print(f"🔄 Status: {gcode_state} | Progress: {mc_percent}% | Bed: {bed_temp}°C | Nozzle: {nozzle_temp}°C")
-            
-            # Check if print is starting
-            if not self.is_printing and gcode_state == "RUNNING" and mc_percent > 0:
-                self.start_print_tracking(gcode_file, gcode_start_time, filament_type)
-            
-            # Check if print is completed
-            elif self.is_printing and (mc_percent >= 100 or gcode_state in ["FINISH", "FAILED"]):
-                self.end_print_tracking(gcode_state == "FAILED")
-            
-            # Update progress for current print
-            if self.is_printing:
-                self.update_progress(mc_percent, mc_remaining_time)
-            
-            # Update filament type if changed
-            if filament_type != "Unknown":
-                self.current_filament_type = filament_type
-            
-            self.last_mc_percent = mc_percent
-            self.data_received = True
-            
-        except json.JSONDecodeError:
-            print("❌ Failed to parse JSON message")
-        except Exception as e:
-            print(f"❌ Error processing message: {e}")
-
-    def start_print_tracking(self, gcode_file: str, gcode_start_time: str, filament_type: str):
+    def start_print_tracking(self, gcode_file: str, gcode_start_time: int, filament_type: str):
         """Start tracking a new print"""
         self.is_printing = True
         self.print_start_time = datetime.now()
         self.current_gcode_file = gcode_file
         self.current_filament_type = filament_type
-        
-        try:
-            self.print_start_gcode_time = int(gcode_start_time)
-        except:
-            self.print_start_gcode_time = 0
+        self.print_start_gcode_time = gcode_start_time
         
         print(f"\n" + "="*60)
         print(f"🚀 PRINT STARTED")
         print(f"⏰ Start Time: {self.print_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📁 File: {gcode_file}")
+        print(f"📁 File: {os.path.basename(gcode_file) if gcode_file else 'Unknown'}")
         print(f"🧵 Filament: {filament_type}")
         print(f"🌡️  Bed: {self.bed_temp}°C | Nozzle: {self.nozzle_temp}°C")
         print("="*60)
 
-    def update_progress(self, mc_percent: int, mc_remaining_time: int):
+    def update_progress(self, progress: int, remaining_time: int):
         """Update progress display"""
-        remaining_str = f"{mc_remaining_time}min" if mc_remaining_time > 0 else "Unknown"
+        remaining_str = f"{remaining_time}min" if remaining_time > 0 else "Unknown"
         current_time = datetime.now().strftime('%H:%M:%S')
-        print(f"\r🖨️  [{current_time}] Progress: {mc_percent:3d}% | Remaining: {remaining_str:>8} | {self.current_filament_type}", end="", flush=True)
+        filament_str = self.current_filament_type if self.current_filament_type else "Unknown"
+        print(f"\r🖨️  [{current_time}] Progress: {progress:3d}% | Remaining: {remaining_str:>8} | {filament_str}", end="", flush=True)
 
     def end_print_tracking(self, failed: bool = False):
         """End print tracking and log to Excel"""
@@ -328,7 +311,7 @@ class BambuPrintLogger:
         print(f"⏰ End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"⏱️  Duration: {self.format_duration(duration_minutes)}")
         
-        # Estimate filament usage (rough calculation)
+        # Estimate filament usage (rough calculation based on print time)
         estimated_filament = self.estimate_filament_usage(duration_minutes)
         
         # Create log entry
@@ -337,8 +320,8 @@ class BambuPrintLogger:
             end_time=end_time.strftime('%Y-%m-%d %H:%M:%S'),
             print_duration=self.format_duration(duration_minutes),
             duration_minutes=duration_minutes,
-            gcode_file=os.path.basename(self.current_gcode_file),
-            filament_type=self.current_filament_type,
+            gcode_file=os.path.basename(self.current_gcode_file) if self.current_gcode_file else "Unknown",
+            filament_type=self.current_filament_type if self.current_filament_type else "Unknown",
             filament_used_grams=estimated_filament,
             bed_temp=self.bed_temp,
             nozzle_temp=self.nozzle_temp,
@@ -349,15 +332,15 @@ class BambuPrintLogger:
         self.save_to_excel(log_entry)
         
         print(f"📊 Logged to Excel: {self.excel_file}")
-        print(f"💡 Manual updates needed:")
-        print(f"   - Actual filament used (estimated: {estimated_filament:.1f}g)")
-        print(f"   - G-code filename if needed")
-        print(f"   - Add notes about print quality")
+        print(f"💡 Manual updates recommended:")
+        print(f"   - Verify filament used (estimated: {estimated_filament:.1f}g)")
+        print(f"   - Add notes about print quality/issues")
         print("="*60)
         print("⏳ Waiting for next print...")
 
     def estimate_filament_usage(self, duration_minutes: int) -> float:
         """Rough estimate of filament usage based on print time"""
+        # Very rough estimate: 10g per hour average
         return (duration_minutes / 60.0) * 10.0
 
     def format_duration(self, minutes: int) -> str:
@@ -401,60 +384,120 @@ class BambuPrintLogger:
         except Exception as e:
             print(f"❌ Error saving to Excel: {e}")
 
-    def run_connection_tests(self) -> bool:
-        """Run all connection tests"""
-        print("🔍 RUNNING CONNECTION TESTS")
-        print("="*60)
+    def monitor_prints(self):
+        """Main monitoring loop"""
+        print(f"🔄 Starting print monitoring...")
+        print(f"📍 Polling every {self.poll_interval} seconds")
+        print("⏳ Waiting for prints to start...\n")
         
-        # Test 1: Network connectivity
-        if not self.test_network_connectivity():
-            return False
+        consecutive_errors = 0
+        max_errors = 10
         
-        # Test 2: Printer ID validation
-        if not self.validate_printer_id():
-            return False
+        while self.polling:
+            try:
+                # Get printer status
+                status = self.get_printer_status()
+                
+                if status:
+                    consecutive_errors = 0  # Reset error counter
+                    self.process_status_update(status)
+                else:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_errors:
+                        print(f"\n❌ Too many consecutive API errors ({max_errors})")
+                        print(f"   Check printer connection and restart logger")
+                        break
+                
+                self.message_count += 1
+                
+                # Sleep between polls
+                time.sleep(self.poll_interval)
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"❌ Error in monitoring loop: {e}")
+                consecutive_errors += 1
+                if consecutive_errors >= max_errors:
+                    break
+                time.sleep(self.poll_interval)
+
+    def process_status_update(self, status_data: Dict[str, Any]):
+        """Process a status update from the printer"""
+        print_data = self.extract_print_data(status_data)
         
-        # Test 3: MQTT connection and data reception
-        if not self.test_mqtt_connection():
-            return False
+        progress = int(print_data.get('progress', 0))
+        state = print_data.get('state', '').upper()
+        gcode_file = print_data.get('gcode_file', '')
+        bed_temp = print_data.get('bed_temp', 0.0)
+        nozzle_temp = print_data.get('nozzle_temp', 0.0)
+        remaining_time = int(print_data.get('remaining_time', 0))
+        filament_type = print_data.get('filament_type', 'Unknown')
+        start_time = int(print_data.get('start_time', 0))
         
-        print("="*60)
-        print("🎉 ALL TESTS PASSED - PRINTER IS ACCESSIBLE")
-        print("="*60)
-        return True
+        # Update current temperatures
+        self.bed_temp = bed_temp
+        self.nozzle_temp = nozzle_temp
+        
+        # Show confirmation of data reception (only first few times)
+        if self.message_count <= 3:
+            print(f"📨 Update #{self.message_count}: Progress: {progress}%, State: {state}")
+            if self.message_count == 3:
+                print(f"✅ API polling working - switching to print monitoring mode")
+        
+        # Check if print is starting
+        if not self.is_printing and state in ['RUNNING', 'PRINTING'] and progress > 0:
+            self.start_print_tracking(gcode_file, start_time, filament_type)
+        
+        # Check if print is completed or failed
+        elif self.is_printing and (progress >= 100 or state in ['FINISH', 'FINISHED', 'FAILED', 'PAUSED', 'STOPPED']):
+            failed = state in ['FAILED', 'STOPPED']
+            self.end_print_tracking(failed)
+        
+        # Update progress for current print
+        if self.is_printing and progress != self.last_progress:
+            self.update_progress(progress, remaining_time)
+            self.last_progress = progress
+        
+        # Update filament type if we got better info
+        if filament_type != "Unknown":
+            self.current_filament_type = filament_type
+        
+        # Show periodic status updates when not printing
+        if not self.is_printing and self.message_count % 20 == 0:  # Every ~1 minute
+            current_time = datetime.now().strftime('%H:%M:%S')
+            print(f"💤 [{current_time}] Idle - Bed: {bed_temp}°C | Nozzle: {nozzle_temp}°C | State: {state}")
 
     def run(self):
-        """Start the logging loop"""
+        """Start the logging process"""
         try:
-            # Run connection tests first
-            if not self.run_connection_tests():
-                print("\n❌ Connection tests failed. Please check:")
+            print("🖨️  BAMBU LAB LOCAL API PRINT LOGGER")
+            print("="*50)
+            
+            # Test connection first
+            if not self.test_connection():
+                print("\n❌ Connection test failed. Please check:")
                 print("   1. Printer IP address is correct")
-                print("   2. Printer is powered on and connected to network")
-                print("   3. Printer ID is correct")
-                print("   4. No firewall blocking MQTT port 1883")
+                print("   2. Printer is powered on and connected to network") 
+                print("   3. Access code is correct")
+                print("   4. Printer firmware supports API access")
                 return
             
             print(f"\n🚀 Starting print logger...")
-            print(f"📍 Monitoring: {self.bambu_ip} (ID: {self.bambu_id})")
+            print(f"📍 Monitoring: {self.bambu_ip}")
             print(f"📊 Excel file: {self.excel_file}")
-            print("⏳ Waiting for prints to start...\n")
             
-            self.mqtt_client.connect(self.bambu_ip, 1883, 60)
-            self.mqtt_client.loop_start()
+            # Start monitoring
+            self.polling = True
+            self.monitor_prints()
             
-            # Keep running until interrupted
-            while True:
-                time.sleep(1)
-                
         except KeyboardInterrupt:
             print("\n\n🛑 Stopping logger...")
             self.display_summary()
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"❌ Fatal error: {e}")
         finally:
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
+            self.polling = False
 
     def display_summary(self):
         """Display current session summary"""
@@ -480,7 +523,7 @@ class BambuPrintLogger:
 
 def get_printer_info():
     """Interactive function to get printer information"""
-    print("🖨️  BAMBU LAB PRINT LOGGER SETUP")
+    print("🖨️  BAMBU LAB LOCAL API LOGGER SETUP")
     print("="*50)
     
     while True:
@@ -505,9 +548,9 @@ def get_printer_info():
             continue
     
     while True:
-        printer_id = input("Enter printer ID (e.g., 00M00A261900054): ").strip()
-        if not printer_id:
-            print("❌ Printer ID cannot be empty")
+        access_code = input("Enter printer access code: ").strip()
+        if not access_code:
+            print("❌ Access code cannot be empty")
             continue
         break
     
@@ -517,25 +560,25 @@ def get_printer_info():
     elif not excel_file.endswith('.xlsx'):
         excel_file += '.xlsx'
     
-    return ip, printer_id, excel_file
+    return ip, access_code, excel_file
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Log Bambu Lab prints to Excel with connection testing")
+    parser = argparse.ArgumentParser(description="Log Bambu Lab prints to Excel using local API")
     parser.add_argument("--ip", help="IP address of the Bambu Lab printer")
-    parser.add_argument("--id", help="Bambu Lab printer ID")
+    parser.add_argument("--code", help="Printer access code")
     parser.add_argument("--excel", "-e", default="print_log.xlsx", 
                        help="Excel file name (default: print_log.xlsx)")
     
     args = parser.parse_args()
     
     # Interactive mode if no arguments provided
-    if not args.ip or not args.id:
-        ip, printer_id, excel_file = get_printer_info()
+    if not args.ip or not args.code:
+        ip, access_code, excel_file = get_printer_info()
     else:
-        ip, printer_id, excel_file = args.ip, args.id, args.excel
+        ip, access_code, excel_file = args.ip, args.code, args.excel
     
-    logger = BambuPrintLogger(ip, printer_id, excel_file)
+    logger = BambuLocalAPILogger(ip, access_code, excel_file)
     logger.run()
 
 
