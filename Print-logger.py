@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bambu Lab Local Print Logger with API Integration
+Bambu Lab Print Logger
 Automatically logs print data to Excel using local REST API calls.
 LAN-only version for direct printer communication.
 """
@@ -76,14 +76,14 @@ class BambuLocalAPILogger:
 
     def test_connection(self) -> bool:
         """Test connection to local printer API"""
-        print(f"🔍 Testing connection to {self.bambu_ip}...")
+        print(f" Testing connection to {self.bambu_ip}...")
         
         # Test both HTTP and HTTPS
         for use_https in [False, True]:
             base_url = self.https_base_url if use_https else self.base_url
             protocol = "HTTPS" if use_https else "HTTP"
             
-            print(f"🔗 Trying {protocol} connection...")
+            print(f" Trying {protocol} connection...")
             
             # Common API endpoints to try
             endpoints = [
@@ -101,20 +101,20 @@ class BambuLocalAPILogger:
                     response = self.session.get(url, headers=headers, timeout=5)
                     
                     if response.status_code == 200:
-                        print(f"✅ {protocol} connection successful on {endpoint}")
+                        print(f" {protocol} connection successful on {endpoint}")
                         self.base_url = base_url
                         self.use_https = use_https
                         
                         # Verify we can get printer data
                         data = response.json()
                         if self.validate_printer_data(data):
-                            print(f"📊 Printer data accessible")
+                            print(f" Printer data accessible")
                             return True
                         else:
-                            print(f"⚠️  Connected but printer data format unexpected")
+                            print(f" Connected but printer data format unexpected")
                             
                     elif response.status_code == 401:
-                        print(f"❌ Authentication failed on {endpoint} - check access code")
+                        print(f" Authentication failed on {endpoint} - check access code")
                         
                     elif response.status_code == 404:
                         continue  # Try next endpoint
@@ -126,12 +126,12 @@ class BambuLocalAPILogger:
                 except Exception as e:
                     continue
         
-        print(f"❌ Could not establish connection to {self.bambu_ip}")
-        print(f"   Possible issues:")
-        print(f"   - Printer is not powered on")
-        print(f"   - Wrong IP address")
-        print(f"   - Wrong access code")
-        print(f"   - Printer doesn't support API access")
+        print(f"Could not establish connection to {self.bambu_ip}")
+        print(f"Possible issues:")
+        print(f"    - Printer is not powered on")
+        print(f"    - Wrong IP address")
+        print(f"    - Wrong access code")
+        print(f"    - Printer doesn't support API access")
         return False
 
     def validate_printer_data(self, data: Dict[str, Any]) -> bool:
@@ -173,17 +173,17 @@ class BambuLocalAPILogger:
                 else:
                     # Log error but continue trying
                     if self.message_count <= 3:
-                        print(f"⚠️  API returned HTTP {response.status_code} for {endpoint}")
+                        print(f"  API returned HTTP {response.status_code} for {endpoint}")
             
             return None
             
         except requests.exceptions.RequestException as e:
             if self.message_count <= 3:
-                print(f"❌ API request error: {e}")
+                print(f" API request error: {e}")
             return None
         except Exception as e:
             if self.message_count <= 3:
-                print(f"❌ Unexpected error: {e}")
+                print(f" Unexpected error: {e}")
             return None
 
     def extract_print_data(self, status_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -212,7 +212,7 @@ class BambuLocalAPILogger:
         return extracted
 
     def safe_get_numeric(self, data: Dict[str, Any], keys: list, default: float = 0.0) -> float:
-        """Safely get numeric value from data using multiple possible keys"""
+        """Get numeric value from data using multiple possible keys"""
         for key in keys:
             if key in data:
                 try:
@@ -222,7 +222,7 @@ class BambuLocalAPILogger:
         return default
 
     def safe_get_string(self, data: Dict[str, Any], keys: list, default: str = '') -> str:
-        """Safely get string value from data using multiple possible keys"""
+        """Get string value from data using multiple possible keys"""
         for key in keys:
             if key in data and data[key]:
                 return str(data[key])
@@ -266,9 +266,9 @@ class BambuLocalAPILogger:
                 'Bed Temp (°C)', 'Nozzle Temp (°C)', 'Notes'
             ])
             df.to_excel(self.excel_file, index=False)
-            print(f"✅ Created new Excel file: {self.excel_file}")
+            print(f" Created new Excel file: {self.excel_file}")
         else:
-            print(f"✅ Using existing Excel file: {self.excel_file}")
+            print(f" Using existing Excel file: {self.excel_file}")
 
     def start_print_tracking(self, gcode_file: str, gcode_start_time: int, filament_type: str):
         """Start tracking a new print"""
@@ -279,11 +279,11 @@ class BambuLocalAPILogger:
         self.print_start_gcode_time = gcode_start_time
         
         print(f"\n" + "="*60)
-        print(f"🚀 PRINT STARTED")
-        print(f"⏰ Start Time: {self.print_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📁 File: {os.path.basename(gcode_file) if gcode_file else 'Unknown'}")
-        print(f"🧵 Filament: {filament_type}")
-        print(f"🌡️  Bed: {self.bed_temp}°C | Nozzle: {self.nozzle_temp}°C")
+        print(f" PRINT STARTED")
+        print(f" Start Time: {self.print_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f" File: {os.path.basename(gcode_file) if gcode_file else 'Unknown'}")
+        print(f" Filament: {filament_type}")
+        print(f"  Bed: {self.bed_temp}°C | Nozzle: {self.nozzle_temp}°C")
         print("="*60)
 
     def update_progress(self, progress: int, remaining_time: int):
@@ -291,7 +291,7 @@ class BambuLocalAPILogger:
         remaining_str = f"{remaining_time}min" if remaining_time > 0 else "Unknown"
         current_time = datetime.now().strftime('%H:%M:%S')
         filament_str = self.current_filament_type if self.current_filament_type else "Unknown"
-        print(f"\r🖨️  [{current_time}] Progress: {progress:3d}% | Remaining: {remaining_str:>8} | {filament_str}", end="", flush=True)
+        print(f"\r [{current_time}] Progress: {progress:3d}% | Remaining: {remaining_str:>8} | {filament_str}", end="", flush=True)
 
     def end_print_tracking(self, failed: bool = False):
         """End print tracking and log to Excel"""
@@ -303,13 +303,13 @@ class BambuLocalAPILogger:
         duration = end_time - self.print_start_time
         duration_minutes = int(duration.total_seconds() / 60)
         
-        status_emoji = "❌" if failed else "✅"
+        status_emoji = "" if failed else ""
         status_text = "FAILED" if failed else "COMPLETED"
         
         print(f"\n" + "="*60)
         print(f"{status_emoji} PRINT {status_text}")
-        print(f"⏰ End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"⏱️  Duration: {self.format_duration(duration_minutes)}")
+        print(f"End Time: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {self.format_duration(duration_minutes)}")
         
         # Estimate filament usage (rough calculation based on print time)
         estimated_filament = self.estimate_filament_usage(duration_minutes)
@@ -331,12 +331,12 @@ class BambuLocalAPILogger:
         # Save to Excel
         self.save_to_excel(log_entry)
         
-        print(f"📊 Logged to Excel: {self.excel_file}")
-        print(f"💡 Manual updates recommended:")
-        print(f"   - Verify filament used (estimated: {estimated_filament:.1f}g)")
-        print(f"   - Add notes about print quality/issues")
+        print(f"Logged to Excel: {self.excel_file}")
+        print(f"Manual updates recommended:")
+        print(f"    - Verify filament used (estimated: {estimated_filament:.1f}g)")
+        print(f"    - Add notes about print quality/issues")
         print("="*60)
-        print("⏳ Waiting for next print...")
+        print("Waiting for next print...")
 
     def estimate_filament_usage(self, duration_minutes: int) -> float:
         """Rough estimate of filament usage based on print time"""
@@ -382,13 +382,13 @@ class BambuLocalAPILogger:
             df.to_excel(self.excel_file, index=False)
             
         except Exception as e:
-            print(f"❌ Error saving to Excel: {e}")
+            print(f" Error saving to Excel: {e}")
 
     def monitor_prints(self):
         """Main monitoring loop"""
-        print(f"🔄 Starting print monitoring...")
-        print(f"📍 Polling every {self.poll_interval} seconds")
-        print("⏳ Waiting for prints to start...\n")
+        print(f"Starting print monitoring...")
+        print(f"Polling every {self.poll_interval} seconds")
+        print("Waiting for prints to start...\n")
         
         consecutive_errors = 0
         max_errors = 10
@@ -404,8 +404,8 @@ class BambuLocalAPILogger:
                 else:
                     consecutive_errors += 1
                     if consecutive_errors >= max_errors:
-                        print(f"\n❌ Too many consecutive API errors ({max_errors})")
-                        print(f"   Check printer connection and restart logger")
+                        print(f"\nToo many consecutive API errors ({max_errors})")
+                        print(f"Check printer connection and restart logger")
                         break
                 
                 self.message_count += 1
@@ -416,7 +416,7 @@ class BambuLocalAPILogger:
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                print(f"❌ Error in monitoring loop: {e}")
+                print(f"Error in monitoring loop: {e}")
                 consecutive_errors += 1
                 if consecutive_errors >= max_errors:
                     break
@@ -441,9 +441,9 @@ class BambuLocalAPILogger:
         
         # Show confirmation of data reception (only first few times)
         if self.message_count <= 3:
-            print(f"📨 Update #{self.message_count}: Progress: {progress}%, State: {state}")
+            print(f"Update #{self.message_count}: Progress: {progress}%, State: {state}")
             if self.message_count == 3:
-                print(f"✅ API polling working - switching to print monitoring mode")
+                print(f"API polling working - switching to print monitoring mode")
         
         # Check if print is starting
         if not self.is_printing and state in ['RUNNING', 'PRINTING'] and progress > 0:
@@ -471,31 +471,31 @@ class BambuLocalAPILogger:
     def run(self):
         """Start the logging process"""
         try:
-            print("🖨️  BAMBU LAB LOCAL API PRINT LOGGER")
+            print("     BAMBU LAB LOCAL API PRINT LOGGER")
             print("="*50)
             
             # Test connection first
             if not self.test_connection():
-                print("\n❌ Connection test failed. Please check:")
-                print("   1. Printer IP address is correct")
-                print("   2. Printer is powered on and connected to network") 
-                print("   3. Access code is correct")
-                print("   4. Printer firmware supports API access")
+                print("\n Connection test failed. Please check:")
+                print("     1. Printer IP address is correct")
+                print("     2. Printer is powered on and connected to network") 
+                print("     3. Access code is correct")
+                print("     4. Printer firmware supports API access")
                 return
             
-            print(f"\n🚀 Starting print logger...")
-            print(f"📍 Monitoring: {self.bambu_ip}")
-            print(f"📊 Excel file: {self.excel_file}")
+            print(f"\nStarting print logger...")
+            print(f"Monitoring: {self.bambu_ip}")
+            print(f"Excel file: {self.excel_file}")
             
             # Start monitoring
             self.polling = True
             self.monitor_prints()
             
         except KeyboardInterrupt:
-            print("\n\n🛑 Stopping logger...")
+            print("\n\nStopping logger...")
             self.display_summary()
         except Exception as e:
-            print(f"❌ Fatal error: {e}")
+            print(f"Fatal error: {e}")
         finally:
             self.polling = False
 
@@ -508,34 +508,34 @@ class BambuLocalAPILogger:
                 total_minutes = df['Duration (min)'].sum()
                 total_filament = df['Filament Used (g)'].sum()
                 
-                print(f"\n📈 SESSION SUMMARY:")
-                print(f"   Total prints logged: {total_prints}")
-                print(f"   Total print time: {self.format_duration(int(total_minutes))}")
-                print(f"   Total filament used: {total_filament:.1f}g")
+                print(f"\nSESSION SUMMARY:")
+                print(f"    Total prints logged: {total_prints}")
+                print(f"    Total print time: {self.format_duration(int(total_minutes))}")
+                print(f"    Total filament used: {total_filament:.1f}g")
                 
                 if total_prints > 0:
-                    print(f"\n📋 Recent prints:")
+                    print(f"\nRecent prints:")
                     for _, row in df.tail(3).iterrows():
                         print(f"   • {row['G-code File']} - {row['Print Duration']} ({row['Filament Type']})")
         except:
-            print("📊 No previous prints found")
+            print("No previous prints found")
 
 
 def get_printer_info():
     """Interactive function to get printer information"""
-    print("🖨️  BAMBU LAB LOCAL API LOGGER SETUP")
+    print("     BAMBU LAB LOCAL API LOGGER SETUP")
     print("="*50)
     
     while True:
         ip = input("Enter printer IP address (e.g., 192.168.1.100): ").strip()
         if not ip:
-            print("❌ IP address cannot be empty")
+            print("IP address cannot be empty")
             continue
         
         # Basic IP validation
         parts = ip.split('.')
         if len(parts) != 4:
-            print("❌ Invalid IP format. Use format: 192.168.1.100")
+            print("Invalid IP format. Use format: 192.168.1.100")
             continue
         
         try:
@@ -544,13 +544,13 @@ def get_printer_info():
                     raise ValueError
             break
         except ValueError:
-            print("❌ Invalid IP address. Each number must be 0-255")
+            print("Invalid IP address. Each number must be 0-255")
             continue
     
     while True:
         access_code = input("Enter printer access code: ").strip()
         if not access_code:
-            print("❌ Access code cannot be empty")
+            print("Access code cannot be empty")
             continue
         break
     
